@@ -1,6 +1,7 @@
 import xml.etree.ElementTree as ET
 import csv
 import re
+import requests
 from typing import Dict, Any, Optional, List
 
 def clean_text(text: Optional[str]) -> str:
@@ -43,6 +44,63 @@ def format_categories(categories: List[str]) -> str:
     # Format with <'...'>
     formatted = " ".join([f"<'{cat}'>" for cat in unique_categories])
     return formatted
+
+def get_address_from_coords(latitude: str, longitude: str) -> Dict[str, str]:
+    """Get address information from coordinates using reverse geocoding."""
+    address_info = {
+        'addressStreet': '',
+        'addressLocation': '',
+        'addressCap': '',
+        'addressMunicipalities': '',
+        'addressProvince': '',
+        'addressRegion': '',
+        'addressText': ''
+    }
+    
+    if not latitude or not longitude:
+        return address_info
+    
+    try:
+        # Using OpenStreetMap Nominatim for reverse geocoding
+        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={latitude}&lon={longitude}"
+        
+        headers = {
+            'User-Agent': 'XML-CSV-Mapper/1.0'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            address = data.get('address', {})
+            
+            # Extract address components
+            street = address.get('road', '')
+            street_number = address.get('house_number', '')
+            postcode = address.get('postcode', '')
+            city = address.get('city') or address.get('town') or address.get('village', '')
+            province = address.get('county', '')
+            region = address.get('state', '')
+            
+            address_info['addressStreet'] = clean_text(street)
+            address_info['addressLocation'] = clean_text(city)
+            address_info['addressCap'] = clean_text(postcode)
+            address_info['addressMunicipalities'] = clean_text(city)
+            address_info['addressProvince'] = clean_text(province)
+            address_info['addressRegion'] = clean_text(region)
+            
+            # Format addressText as "via Name, number - CAP City"
+            if street and street_number and postcode and city:
+                address_info['addressText'] = f"{street}, {street_number} - {postcode} {city}"
+            elif street and postcode and city:
+                address_info['addressText'] = f"{street} - {postcode} {city}"
+            
+    except requests.exceptions.RequestException as e:
+        print(f"⚠ Warning: Could not fetch address for coords ({latitude}, {longitude}): {e}")
+    except Exception as e:
+        print(f"⚠ Warning: Error processing address data: {e}")
+    
+    return address_info
 
 def parse_venue_xml(venue_elem) -> Dict[str, Any]:
     """Parse a single Venue XML element and extract data."""
@@ -113,6 +171,12 @@ def parse_venue_xml(venue_elem) -> Dict[str, Any]:
             y_coord = geocoords.findtext('YCoord', '')
             data['longitude'] = clean_text(x_coord)
             data['latitude'] = clean_text(y_coord)
+            
+            # Get address information from coordinates
+            if data['latitude'] and data['longitude']:
+                print(f"  📍 Fetching address for {data['name']} ({data['latitude']}, {data['longitude']})...")
+                address_info = get_address_from_coords(data['latitude'], data['longitude'])
+                data.update(address_info)
     
     return data
 
@@ -173,7 +237,7 @@ def main():
     input_file = 'input.xml'
     output_file = 'venues.csv'
     
-    print(f"Reading venues from '{input_file}'...")
+    print(f"Reading venues from '{input_file}'...\n")
     
     # Parse all venues from XML file
     venues = parse_venues_from_file(input_file)
@@ -186,6 +250,8 @@ def main():
         print(f"\nProcessed {len(venues)} venues:")
         for i, venue in enumerate(venues, 1):
             print(f"  {i}. {venue['name']} (ID: {venue['sourceId']}, Categories: {venue['category']})")
+            if venue['addressText']:
+                print(f"     Address: {venue['addressText']}")
     else:
         print("No venues found in XML file.")
 
