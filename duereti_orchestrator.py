@@ -15,6 +15,8 @@ Uso:
     --tipo LETTURE \
     --data-inizio 2024-01-01 \
     --data-fine 2024-01-31
+
+Config file (YAML) supported. CLI args override config and environment variables.
 """
 
 import asyncio
@@ -41,6 +43,12 @@ except ImportError:
     MYSQL_AVAILABLE = False
     MySQLError = Exception
 
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except Exception:
+    YAML_AVAILABLE = False
+
 # ============================================================================
 # CONFIGURAZIONE LOGGING
 # ============================================================================
@@ -56,7 +64,7 @@ logging.basicConfig(
 logger = logging.getLogger("DueretiOrchestrator")
 
 # ============================================================================
-# CONFIGURAZIONE
+# CONFIGURAZIONE DEFAULT
 # ============================================================================
 
 # Mistral/OpenWebUI
@@ -118,13 +126,16 @@ class DatabaseManager:
 
     def disconnect(self):
         """Chiudi la connessione."""
-        if self.connection and self.connection.is_connected():
-            self.connection.close()
+        if self.connection and getattr(self.connection, 'is_connected', lambda: False)():
+            try:
+                self.connection.close()
+            except Exception:
+                pass
             logger.info("Disconnesso da MySQL/MariaDB")
 
     def create_tables(self) -> bool:
         """Crea le tabelle se non esistono."""
-        if not self.connection or not self.connection.is_connected():
+        if not self.connection or not getattr(self.connection, 'is_connected', lambda: False)():
             logger.error("Non connesso al database")
             return False
 
@@ -225,7 +236,7 @@ class DatabaseManager:
         file_count: int = 0,
     ) -> bool:
         """Registra l'esportazione nel log."""
-        if not self.connection or not self.connection.is_connected():
+        if not self.connection or not getattr(self.connection, 'is_connected', lambda: False)():
             logger.warning("Non connesso al DB, skip log export")
             return False
 
@@ -263,7 +274,7 @@ class DatabaseManager:
         Inserisce record LETTURE nella tabella.
         Ogni record deve avere: pod, df, data_lettura, ora_inizio, ora_fine, valore, unita_misura, stato
         """
-        if not self.connection or not self.connection.is_connected():
+        if not self.connection or not getattr(self.connection, 'is_connected', lambda: False)():
             logger.warning("Non connesso al DB, skip insert letture")
             return 0
 
@@ -316,7 +327,7 @@ class DatabaseManager:
         Inserisce record CURVE nella tabella.
         Struttura analoga a LETTURE.
         """
-        if not self.connection or not self.connection.is_connected():
+        if not self.connection or not getattr(self.connection, 'is_connected', lambda: False)():
             logger.warning("Non connesso al DB, skip insert curve")
             return 0
 
@@ -520,7 +531,8 @@ def _call_mistral_validation(user_message: str) -> dict[str, Any]:
             "Content-Type": "application/json",
         }
         if OPENWEBUI_API_KEY:
-            headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
+            # Supporta sia token puro che prefisso Bearer/Token fornito dall'utente
+            headers["Authorization"] = OPENWEBUI_API_KEY if OPENWEBUI_API_KEY.startswith("Bearer ") or OPENWEBUI_API_KEY.startswith("Token ") else f"Bearer {OPENWEBUI_API_KEY}"
 
         payload = {
             "model": MISTRAL_MODEL,
@@ -541,6 +553,7 @@ def _call_mistral_validation(user_message: str) -> dict[str, Any]:
         response = requests.post(
             f"{OPENWEBUI_URL}/api/chat/completions",
             json=payload,
+            headers=headers,
             timeout=30,
         )
         response.raise_for_status()
@@ -581,7 +594,7 @@ class DueretiToolInvoker:
             "Content-Type": "application/json",
         }
         if OPENWEBUI_API_KEY:
-            self.headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
+            self.headers["Authorization"] = OPENWEBUI_API_KEY if OPENWEBUI_API_KEY.startswith("Bearer ") or OPENWEBUI_API_KEY.startswith("Token ") else f"Bearer {OPENWEBUI_API_KEY}"
 
     def _call_tool(self, tool_name: str, tool_call_id: str, params: dict) -> str:
         """Invoca un tool Duereti tramite OpenWebUI."""
@@ -1011,6 +1024,16 @@ async def main():
         help="Nome modello Mistral",
     )
     parser.add_argument(
+        "--openwebui-api-key",
+        default=None,
+        help="API key o token per autenticare verso OpenWebUI (override env)",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="File di configurazione YAML (opzionale). I valori CLI sovrascrivono il file.",
+    )
+    parser.add_argument(
         "--db-host",
         default="localhost",
         help="MySQL host",
@@ -1039,14 +1062,38 @@ async def main():
 
     args = parser.parse_args()
 
-    # Override env se passati da CLI
-    globals()["OPENWEBUI_URL"] = args.openwebui_url
-    globals()["MISTRAL_MODEL"] = args.mistral_model
-    globals()["DB_HOST"] = args.db_host
-    globals()["DB_PORT"] = args.db_port
-    globals()["DB_USER"] = args.db_user
-    globals()["DB_PASSWORD"] = args.db_password
-    globals()["DB_NAME"] = args.db_name
+    # Load config file if provided
+    config = {}
+    if args.config:
+        if not YAML_AVAILABLE:
+            logger.error("PyYAML non installato: pip install pyyaml")
+            print(json.dumps({"status": "error", "error": "PyYAML non installato"}, indent=2))
+            return 2
+        try:
+            with open(args.config, 'r', encoding='utf-8') as cf:
+                config = yaml.safe_load(cf) or {}
+                logger.info(f"Configurazione caricata da {args.config}: {config}")
+        except Exception as e:
+            logger.error(f"Errore caricamento config {args.config}: {e}")
+            print(json.dumps({"status": "error", "error": f"Errore caricamento config: {e}"}, indent=2))
+            return 2
+
+    # Override env/defaults with config, then CLI
+    def pick(name, cli_val, config_key, env_val):
+        if cli_val is not None:
+            return cli_val
+        if config_key and config.get(config_key) is not None:
+            return config.get(config_key)
+        return env_val
+
+    globals()["OPENWEBUI_URL"] = pick("OPENWEBUI_URL", args.openwebui_url, "openwebui_url", os.getenv("OPENWEBUI_URL", OPENWEBUI_URL))
+    globals()["MISTRAL_MODEL"] = pick("MISTRAL_MODEL", args.mistral_model, "mistral_model", os.getenv("MISTRAL_MODEL", MISTRAL_MODEL))
+    globals()["OPENWEBUI_API_KEY"] = pick("OPENWEBUI_API_KEY", args.openwebui_api_key, "openwebui_api_key", os.getenv("OPENWEBUI_API_KEY", OPENWEBUI_API_KEY))
+    globals()["DB_HOST"] = pick("DB_HOST", args.db_host, "db_host", os.getenv("DB_HOST", DB_HOST))
+    globals()["DB_PORT"] = int(pick("DB_PORT", args.db_port, "db_port", os.getenv("DB_PORT", DB_PORT)))
+    globals()["DB_USER"] = pick("DB_USER", args.db_user, "db_user", os.getenv("DB_USER", DB_USER))
+    globals()["DB_PASSWORD"] = pick("DB_PASSWORD", args.db_password, "db_password", os.getenv("DB_PASSWORD", DB_PASSWORD))
+    globals()["DB_NAME"] = pick("DB_NAME", args.db_name, "db_name", os.getenv("DB_NAME", DB_NAME))
 
     user_request = (
         f"Valida e recupera i dati Duereti: "
